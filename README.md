@@ -4,6 +4,9 @@
 > sales battle card and (b) a working pilot site with our AI receptionist
 > chatbot embedded, branded as the practice — in under a minute.
 
+**Live:** <https://v0-mirror-hepburnjr-1423s-projects.vercel.app/> (Vercel
+password gate; ask Ross). Branch `main` deploys here automatically.
+
 Built for the Zero-to-Agent London hackathon (May 2026), bundling
 **Vercel** (Gateway, Next.js, Workflow-style background jobs, deploy),
 **Mubit** (operational memory across prospects), and
@@ -61,6 +64,8 @@ Built for the Zero-to-Agent London hackathon (May 2026), bundling
 ```bash
 pnpm install
 cp ../.env .env.local   # AI_GATEWAY_API_KEY, BRIGHTDATA_*, MUBIT_*
+                        # plus UPSTASH_REDIS_REST_KV_REST_API_{URL,TOKEN}
+                        # from the Vercel project (Storage tab)
 pnpm dev                # http://localhost:3000
 ```
 
@@ -94,9 +99,10 @@ v0-mirror/
     api/chat/route.ts                 ← Gateway model + Mubit middleware
     api/booking/{create,slots}/route.ts
   components/chatbot/Chatbot.tsx      ← embedded into /p/[id]
+  workflow/
+    build-pilot.ts                    ← Vercel Workflow: 3 steps (analyse / competitors / pilot)
   lib/
-    jobs.ts                           ← /tmp JSON persistence
-    build-pilot.ts                    ← orchestrator (3 steps)
+    jobs.ts                           ← Upstash Redis persistence (key: job:{id}, TTL 30d)
     profile-prospect.ts               ← BD scrape + Cheerio + LLM
     visual-tokens.ts                  ← BD screenshot + vision
     practice-context.ts               ← shape + fromProfile adapter
@@ -105,10 +111,21 @@ v0-mirror/
     booking.ts                        ← Dentally-shaped stub
 ```
 
+## Production architecture
+
+- **Job state** lives in Vercel-provisioned Upstash Redis (env injected as
+  `UPSTASH_REDIS_REST_KV_REST_API_{URL,TOKEN}`). 30-day TTL per job.
+- **Pipeline** runs as a Vercel Workflow (`workflow/build-pilot.ts`) with
+  three durable `'use step'` functions matching the `JobStep` keys.
+  `POST /api/jobs/create` calls `start(buildPilotWorkflow, …)` and returns
+  immediately; steps run in their own invocations and survive function
+  timeouts.
+- **Reconnects work cross-instance** because every read path
+  (`/api/jobs/[id]/status`, `/p/[id]`, the chatbot's `practiceContext`
+  lookup) goes through the same KV.
+
 ## Known limitations (hackathon scope)
 
-- Persistence is `/tmp` JSON files. Single-instance only; reset on restart.
-  Lift onto KV or Workflow durable state for production.
 - Pilot deploy is in-app (`/p/[id]`) rather than a per-prospect Vercel
   project. The Vercel MCP path (Option B) was descoped for time.
 - Mubit cross-prospect lessons rely on conversions being captured. Until
