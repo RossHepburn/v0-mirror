@@ -1,7 +1,10 @@
 import * as cheerio from "cheerio";
 import { Redis } from "@upstash/redis";
-import { readJob } from "@/lib/jobs";
+import { readJob, updateJob } from "@/lib/jobs";
+import type { RendererTier } from "@/lib/jobs";
 import { fetchHtmlViaBrightData } from "@/lib/bright-data";
+import { readComponent } from "@/lib/compose";
+import { renderClaudeHtml, renderTemplateHtml } from "@/lib/render-fallbacks";
 
 const kv = new Redis({
   url: process.env.UPSTASH_REDIS_REST_KV_REST_API_URL!,
@@ -9,7 +12,9 @@ const kv = new Redis({
 });
 
 const PROXIED_TTL_SECONDS = 60 * 60;
+const RENDERED_TTL_SECONDS = 60 * 60;
 const proxiedKey = (id: string) => `job:${id}:proxied-html`;
+const renderedKey = (id: string, tier: RendererTier) => `job:${id}:rendered-${tier}`;
 
 const SCRIPT_HOST_BLOCKLIST = [
   "google-analytics.com",
@@ -34,6 +39,19 @@ const SCRIPT_HOST_BLOCKLIST = [
   "smooch.io",
   "freshchat.com",
   "userlike.com",
+  // Consent Management Platforms — strip so cookie banners don't obscure the page
+  "cookielaw.org",
+  "cookiebot.com",
+  "onetrust.com",
+  "quantcast.com",
+  "trustarc.com",
+  "cmp.osano.com",
+  "osano.com",
+  "hs-scripts.com",
+  "sourcepoint.com",
+  "consent.cookiebot.com",
+  "consent.cookiefirst.com",
+  "cookieyes.com",
 ];
 
 const ATTR_TARGETS: Array<[string, string]> = [
@@ -68,6 +86,17 @@ function absolutise(value: string | undefined, base: URL): string | undefined {
   }
 }
 
+const FONT_EXT_RE = /\.(woff2|woff|ttf|otf|eot)(\?|#|$)/i;
+
+function isFontUrl(u: string): boolean {
+  return FONT_EXT_RE.test(u);
+}
+
+function proxiedAssetUrl(absoluteUrl: string, requestOrigin: string, rewriteCss = false): string {
+  const base = `${requestOrigin}/api/asset?u=${encodeURIComponent(absoluteUrl)}`;
+  return rewriteCss ? `${base}&rewrite=css` : base;
+}
+
 function rewriteSrcset(value: string, base: URL): string {
   return value
     .split(",")
@@ -81,21 +110,98 @@ function rewriteSrcset(value: string, base: URL): string {
     .join(", ");
 }
 
-function buildWatermark(name: string): string {
-  const safe = name.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+function escAttr(s: string): string {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[c]!));
+}
+
+const TIER_LABELS: Record<RendererTier, { label: string; colour: string }> = {
+  proxy: { label: "Full mirror", colour: "#10b981" },
+  claude: { label: "Brand-matched recreation", colour: "#f59e0b" },
+  template: { label: "Generic template", colour: "#ef4444" },
+};
+
+export function buildWatermark(opts: {
+  practiceName: string;
+  generatedOn: string; // human-readable
+  tier?: RendererTier;
+}): string {
+  const name = escAttr(opts.practiceName);
+  const generatedOn = escAttr(opts.generatedOn);
+  const tier = opts.tier;
+  const tierMeta = tier ? TIER_LABELS[tier] : null;
+  const tierBadge = tierMeta
+    ? `<span style="display:inline-flex;align-items:center;gap:4px;background:${tierMeta.colour};color:#fff;border-radius:999px;padding:1px 8px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.4px;">${escAttr(tierMeta.label)}</span>`
+    : "";
+
+  // Self-contained inline watermark + click-popover. Inline style attrs
+  // beat page stylesheets, max z-index keeps it on top, and a tiny IIFE
+  // wires the toggle + outside-click close.
   return `
-    <div id="__mirror_watermark" style="
-      position: fixed; top: 12px; right: 12px; z-index: 2147483646;
-      background: rgba(15, 23, 42, 0.86); color: #fff; backdrop-filter: blur(8px);
-      padding: 6px 12px; border-radius: 999px; font-size: 11px;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-      letter-spacing: 0.4px; text-transform: uppercase;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.18);
-      pointer-events: none;
-    ">
-      <span style="opacity: 0.7;">Mirror pilot ·</span> ${safe}
+    <div id="__mirror_watermark_root" style="position: fixed; left: 16px; bottom: 16px; z-index: 2147483646; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;">
+      <button id="__mirror_watermark_btn" type="button" aria-label="About this Mirror pilot" style="
+        all: unset; cursor: pointer;
+        display: inline-flex; align-items: center; gap: 6px;
+        background: rgba(0,0,0,0.7); color: #fff; backdrop-filter: blur(8px);
+        padding: 4px 10px; border-radius: 999px;
+        font-size: 10px; font-weight: 500; letter-spacing: 0.3px; text-transform: uppercase;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.18);
+        font-family: inherit; line-height: 1.5;
+      ">
+        <span style="display:inline-block; width: 5px; height: 5px; border-radius: 50%; background: #34d399;"></span>
+        <span>Mirror pilot</span>
+        <span style="opacity: 0.6;">·</span>
+        <span>${name}</span>
+        <span style="margin-left:4px; opacity: 0.85; font-size: 11px; line-height: 1;">ⓘ</span>
+      </button>
+      <div id="__mirror_watermark_popover" role="dialog" aria-labelledby="__mirror_wm_title" style="
+        display: none; position: absolute; left: 0; bottom: 38px; width: 290px;
+        background: #fff; color: #0f172a; border: 1px solid #e2e8f0;
+        border-radius: 12px; padding: 14px 16px; box-shadow: 0 24px 48px rgba(0,0,0,0.18);
+        font-size: 13px; line-height: 1.5; text-align: left; text-transform: none; letter-spacing: 0;
+      ">
+        <div id="__mirror_wm_title" style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+          <strong style="font-size:13px;color:#0f172a;">Mirror pilot</strong>
+          ${tierBadge}
+        </div>
+        <div style="color:#475569;">
+          This is a Mirror pilot — <strong style="color:#0f172a;">${name}</strong>'s
+          site with our AI chatbot embedded.
+        </div>
+        <div style="margin-top:6px;color:#94a3b8;font-size:11px;">Generated on ${generatedOn}.</div>
+        <div style="margin-top:10px;padding-top:10px;border-top:1px solid #f1f5f9;font-size:11px;color:#94a3b8;">
+          Internal sales preview · not affiliated with the practice.
+        </div>
+      </div>
     </div>
+    <script>(function(){
+      var btn = document.getElementById('__mirror_watermark_btn');
+      var pop = document.getElementById('__mirror_watermark_popover');
+      var root = document.getElementById('__mirror_watermark_root');
+      if (!btn || !pop || !root) return;
+      function open(){ pop.style.display='block'; }
+      function close(){ pop.style.display='none'; }
+      function toggle(){ pop.style.display === 'block' ? close() : open(); }
+      btn.addEventListener('click', function(e){ e.stopPropagation(); toggle(); });
+      pop.addEventListener('click', function(e){ e.stopPropagation(); });
+      document.addEventListener('click', function(e){ if (!root.contains(e.target)) close(); });
+      document.addEventListener('keydown', function(e){ if (e.key === 'Escape') close(); });
+    })();</script>
   `;
+}
+
+export function formatGeneratedOn(iso?: string): string {
+  const d = iso ? new Date(iso) : new Date();
+  return d.toLocaleDateString("en-GB", {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
 }
 
 export function rewriteHtml(opts: {
@@ -104,6 +210,8 @@ export function rewriteHtml(opts: {
   jobId: string;
   practiceName: string;
   requestOrigin: string;
+  generatedOn: string;
+  rendererTier?: RendererTier;
 }): string {
   const sourceBase = new URL(opts.sourceUrl);
   const $ = cheerio.load(opts.rawHtml, { decodeEntities: false });
@@ -140,6 +248,23 @@ export function rewriteHtml(opts: {
     });
   }
 
+  // Route external CSS through the asset proxy with CSS rewriting on, so
+  // any @font-face url(...) inside is also proxied (avoiding cross-origin
+  // font CORS rejections).
+  $('link[rel~="stylesheet" i][href]').each((_, el) => {
+    const href = $(el).attr("href");
+    if (!href) return;
+    try {
+      const abs = new URL(href, sourceBase).toString();
+      $(el).attr("href", proxiedAssetUrl(abs, opts.requestOrigin, true));
+      // crossorigin attribute interferes with us serving from same-origin
+      $(el).removeAttr("crossorigin");
+      $(el).removeAttr("integrity");
+    } catch {
+      /* ignore */
+    }
+  });
+
   $("img[srcset], source[srcset]").each((_, el) => {
     const val = $(el).attr("srcset");
     if (!val) return;
@@ -162,6 +287,10 @@ export function rewriteHtml(opts: {
     const next = css.replace(/url\(\s*(['"]?)([^)'"]+)\1\s*\)/g, (_m, q, ref) => {
       if (ref.startsWith("data:")) return `url(${q}${ref}${q})`;
       const abs = absolutise(ref, sourceBase) || ref;
+      // Fonts must be served same-origin to satisfy CORS.
+      if (isFontUrl(abs)) {
+        return `url(${q}${proxiedAssetUrl(abs, opts.requestOrigin)}${q})`;
+      }
       return `url(${q}${abs}${q})`;
     });
     $(el).html(next);
@@ -169,7 +298,13 @@ export function rewriteHtml(opts: {
 
   const body = $("body").first();
   if (body.length) {
-    body.append(buildWatermark(opts.practiceName));
+    body.append(
+      buildWatermark({
+        practiceName: opts.practiceName,
+        generatedOn: opts.generatedOn,
+        tier: opts.rendererTier ?? "proxy",
+      }),
+    );
     body.append(
       `<script src="${opts.requestOrigin}/widget.js" data-mirror-job-id="${opts.jobId}" data-mirror-origin="${opts.requestOrigin}" defer></script>`,
     );
@@ -187,6 +322,84 @@ export function htmlResponseHeaders(): HeadersInit {
     "X-Frame-Options": "SAMEORIGIN",
   };
 }
+
+// ----- Viability assessment -----
+
+export type ProxyAssessment =
+  | { status: "ok"; rawHtml: string; htmlLength: number; bodyTextLength: number; scriptCount: number }
+  | { status: "sparse"; rawHtml: string; htmlLength: number; bodyTextLength: number; scriptCount: number; reason: string }
+  | { status: "blocked"; reason: string };
+
+const SPARSE_BODY_TEXT_THRESHOLD = 500;
+const SPA_SCRIPT_THRESHOLD = 5;
+
+export function inspectProxyHtml(rawHtml: string): {
+  htmlLength: number;
+  bodyTextLength: number;
+  scriptCount: number;
+} {
+  const $ = cheerio.load(rawHtml);
+  const bodyText = $("body").text().replace(/\s+/g, " ").trim();
+  const scriptCount = $("script[src]").length;
+  return {
+    htmlLength: rawHtml.length,
+    bodyTextLength: bodyText.length,
+    scriptCount,
+  };
+}
+
+export async function assessProxyViability(url: string): Promise<ProxyAssessment> {
+  let rawHtml: string;
+  try {
+    rawHtml = await fetchHtmlViaBrightData(url);
+  } catch (err) {
+    return { status: "blocked", reason: `Bright Data fetch failed: ${(err as Error).message}` };
+  }
+  const { htmlLength, bodyTextLength, scriptCount } = inspectProxyHtml(rawHtml);
+  if (bodyTextLength < SPARSE_BODY_TEXT_THRESHOLD && scriptCount > SPA_SCRIPT_THRESHOLD) {
+    return {
+      status: "sparse",
+      rawHtml,
+      htmlLength,
+      bodyTextLength,
+      scriptCount,
+      reason: `body text ${bodyTextLength} chars, ${scriptCount} script[src] tags — likely SPA`,
+    };
+  }
+  return { status: "ok", rawHtml, htmlLength, bodyTextLength, scriptCount };
+}
+
+// ----- Renderers per tier -----
+
+async function renderProxyTier(opts: {
+  jobId: string;
+  requestOrigin: string;
+  rawHtml: string;
+  cacheWrite: boolean;
+}): Promise<string> {
+  const job = await readJob(opts.jobId);
+  if (!job) throw new Error("Job vanished while rendering proxy tier");
+  const practiceName = job.practiceContext?.name || job.profile?.practiceName || "Practice";
+  const rewritten = rewriteHtml({
+    rawHtml: opts.rawHtml,
+    sourceUrl: job.url,
+    jobId: opts.jobId,
+    practiceName,
+    requestOrigin: opts.requestOrigin,
+    generatedOn: formatGeneratedOn(job.createdAt),
+    rendererTier: "proxy",
+  });
+  if (opts.cacheWrite) {
+    try {
+      await kv.set(proxiedKey(opts.jobId), rewritten, { ex: PROXIED_TTL_SECONDS });
+    } catch (err) {
+      console.error("[proxy] cache write failed:", err);
+    }
+  }
+  return rewritten;
+}
+
+// ----- Proxy-only path (used by /api/proxy/[id] and the proxy tier of /p/[id]) -----
 
 export async function getProxiedHtml(opts: {
   jobId: string;
@@ -206,18 +419,10 @@ export async function getProxiedHtml(opts: {
 
   const job = await readJob(opts.jobId);
   if (!job) {
-    return {
-      status: 404,
-      body: "Job not found",
-      headers: { "Content-Type": "text/plain" },
-    };
+    return { status: 404, body: "Job not found", headers: { "Content-Type": "text/plain" } };
   }
   if (!job.url) {
-    return {
-      status: 400,
-      body: "Job has no source URL",
-      headers: { "Content-Type": "text/plain" },
-    };
+    return { status: 400, body: "Job has no source URL", headers: { "Content-Type": "text/plain" } };
   }
 
   let raw: string;
@@ -231,20 +436,111 @@ export async function getProxiedHtml(opts: {
     };
   }
 
-  const practiceName = job.practiceContext?.name || job.profile?.practiceName || "Practice";
-  const rewritten = rewriteHtml({
-    rawHtml: raw,
-    sourceUrl: job.url,
+  const body = await renderProxyTier({
     jobId: opts.jobId,
-    practiceName,
     requestOrigin: opts.requestOrigin,
+    rawHtml: raw,
+    cacheWrite: true,
   });
+  return { status: 200, body, headers: htmlResponseHeaders() };
+}
 
-  try {
-    await kv.set(proxiedKey(opts.jobId), rewritten, { ex: PROXIED_TTL_SECONDS });
-  } catch (err) {
-    console.error("[proxy] cache write failed:", err);
+// ----- Fallback chain dispatcher (used by /p/[id]) -----
+
+export async function getRenderedPilot(opts: {
+  jobId: string;
+  requestOrigin: string;
+  force?: boolean;
+}): Promise<{ status: number; body: string; headers: HeadersInit; tier?: RendererTier }> {
+  const job = await readJob(opts.jobId);
+  if (!job) {
+    return { status: 404, body: "Job not found", headers: { "Content-Type": "text/plain" } };
+  }
+  if (!job.url) {
+    return { status: 400, body: "Job has no source URL", headers: { "Content-Type": "text/plain" } };
+  }
+  if (!job.practiceContext) {
+    return {
+      status: 425,
+      body: "Pilot not ready yet (analysis incomplete)",
+      headers: { "Content-Type": "text/plain" },
+    };
   }
 
-  return { status: 200, body: rewritten, headers: htmlResponseHeaders() };
+  // 1. Use cached decision when present
+  const cachedTier = !opts.force ? job.renderer?.tier : undefined;
+  if (cachedTier) {
+    const cached = await kv.get<string>(renderedKey(opts.jobId, cachedTier)).catch(() => null);
+    if (cached) {
+      return { status: 200, body: cached, headers: htmlResponseHeaders(), tier: cachedTier };
+    }
+  }
+
+  // 2. Try proxy tier (single BD call). On ok → render proxy.
+  const assessment = await assessProxyViability(job.url);
+
+  let chosenTier: RendererTier;
+  let reason: string;
+  let html: string;
+
+  if (assessment.status === "ok") {
+    chosenTier = "proxy";
+    reason = `body ${assessment.bodyTextLength} chars, ${assessment.scriptCount} scripts`;
+    html = await renderProxyTier({
+      jobId: opts.jobId,
+      requestOrigin: opts.requestOrigin,
+      rawHtml: assessment.rawHtml,
+      cacheWrite: true,
+    });
+  } else {
+    // Fall back to claude if a generated component exists
+    const tsx = await readComponent(opts.jobId).catch(() => null);
+    if (tsx) {
+      chosenTier = "claude";
+      reason = `${assessment.status === "sparse" ? assessment.reason : assessment.reason} → using Claude`;
+      html = renderClaudeHtml({
+        jobId: opts.jobId,
+        ctx: job.practiceContext,
+        tsx,
+        requestOrigin: opts.requestOrigin,
+        generatedOn: formatGeneratedOn(job.createdAt),
+      });
+    } else {
+      chosenTier = "template";
+      reason = `${assessment.status === "sparse" ? assessment.reason : assessment.reason} → no Claude component → using template`;
+      html = renderTemplateHtml({
+        jobId: opts.jobId,
+        ctx: job.practiceContext,
+        requestOrigin: opts.requestOrigin,
+        generatedOn: formatGeneratedOn(job.createdAt),
+      });
+    }
+  }
+
+  // 3. Persist tier + cache rendered HTML
+  const persistedAssessment =
+    assessment.status === "blocked"
+      ? { htmlLength: undefined, bodyTextLength: undefined }
+      : { htmlLength: assessment.htmlLength, bodyTextLength: assessment.bodyTextLength };
+
+  try {
+    await updateJob(opts.jobId, (j) => {
+      j.renderer = {
+        tier: chosenTier,
+        reason,
+        htmlLength: persistedAssessment.htmlLength,
+        bodyTextLength: persistedAssessment.bodyTextLength,
+        decidedAt: new Date().toISOString(),
+      };
+    });
+  } catch (err) {
+    console.error("[pilot] failed to persist renderer info:", err);
+  }
+  try {
+    await kv.set(renderedKey(opts.jobId, chosenTier), html, { ex: RENDERED_TTL_SECONDS });
+  } catch (err) {
+    console.error("[pilot] rendered cache write failed:", err);
+  }
+
+  return { status: 200, body: html, headers: htmlResponseHeaders(), tier: chosenTier };
 }
