@@ -8,7 +8,7 @@ import type { PracticeContext } from "./practice-context";
 import type { PracticeProfile } from "./profile-prospect";
 import type { VisualTokens } from "./visual-tokens";
 
-export type StepKey = "analyse" | "competitors" | "pilot";
+export type StepKey = "analyse" | "competitors" | "compose" | "pilot";
 export type StepStatus = "pending" | "in-progress" | "complete" | "error";
 
 export type JobStep = {
@@ -43,6 +43,15 @@ export type Job = {
   practiceContext?: PracticeContext;
   battleCard?: BattleCard;
   pilotPath?: string;
+  v0?: {
+    chatId: string;
+    webUrl: string;
+    demoUrl: string;
+    versionId?: string;
+    status: "pending" | "completed" | "failed";
+    composedAt: string;
+    composeMs: number;
+  };
   error?: string;
 };
 
@@ -53,7 +62,8 @@ const jobKey = (id: string) => `job:${id}`;
 const defaultSteps = (): JobStep[] => [
   { key: "analyse", name: "Analysing the prospect", estimate: "~15s", status: "pending" },
   { key: "competitors", name: "Identifying competitors", estimate: "~25s", status: "pending" },
-  { key: "pilot", name: "Building the pilot site", estimate: "~30s", status: "pending" },
+  { key: "compose", name: "Generating bespoke pilot with v0", estimate: "~30s", status: "pending" },
+  { key: "pilot", name: "Finalising the pilot site", estimate: "~5s", status: "pending" },
 ];
 
 async function writeJob(job: Job): Promise<void> {

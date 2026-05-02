@@ -13,5 +13,5 @@ export default async function PilotPage({
   const { id } = await params;
   const job = await readJob(id);
   if (!job || !job.practiceContext) notFound();
-  return <PilotTemplate jobId={id} ctx={job.practiceContext} />;
+  return <PilotTemplate jobId={id} ctx={job.practiceContext} v0={job.v0} />;
 }

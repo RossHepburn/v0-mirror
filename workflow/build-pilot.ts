@@ -4,6 +4,7 @@ import { profileProspect } from "@/lib/profile-prospect";
 import { extractVisualTokens } from "@/lib/visual-tokens";
 import { fromProfile } from "@/lib/practice-context";
 import { generateBattleCard } from "@/lib/battle-card";
+import { composePilotWithV0 } from "@/lib/compose-pilot";
 
 async function analyseStep(jobId: string, url: string) {
   "use step";
@@ -23,7 +24,7 @@ async function analyseStep(jobId: string, url: string) {
     job.practiceContext = ctx;
   });
   await setStep(jobId, "analyse", "complete");
-  return { profile: extraction.profile, ctx };
+  return { profile: extraction.profile, ctx, visual };
 }
 
 async function competitorsStep(
@@ -47,6 +48,38 @@ async function competitorsStep(
     };
   });
   await setStep(jobId, "competitors", "complete");
+}
+
+async function composeStep(
+  jobId: string,
+  url: string,
+  payload: Awaited<ReturnType<typeof analyseStep>>,
+) {
+  "use step";
+  await setStep(jobId, "compose", "in-progress");
+  try {
+    const result = await composePilotWithV0({
+      url,
+      ctx: payload.ctx,
+      visual: payload.visual,
+    });
+    await updateJob(jobId, (job) => {
+      job.v0 = {
+        chatId: result.chatId,
+        webUrl: result.webUrl,
+        demoUrl: result.demoUrl,
+        versionId: result.versionId,
+        status: result.status,
+        composedAt: new Date().toISOString(),
+        composeMs: result.ms,
+      };
+    });
+    await setStep(jobId, "compose", "complete");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // Compose failure is not fatal — pilot falls back to fixed template.
+    await setStep(jobId, "compose", "error", { error: message });
+  }
 }
 
 async function pilotStep(jobId: string) {
@@ -85,6 +118,7 @@ export async function buildPilotWorkflow(input: { jobId: string; url: string }) 
   try {
     const analysed = await analyseStep(jobId, url);
     await competitorsStep(jobId, url, analysed);
+    await composeStep(jobId, url, analysed);
     await pilotStep(jobId);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

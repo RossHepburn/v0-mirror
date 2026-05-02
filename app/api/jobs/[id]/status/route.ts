@@ -18,6 +18,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     practiceContext: job.practiceContext ?? null,
     battleCard: job.battleCard ?? null,
     pilotPath: job.pilotPath ?? null,
+    v0: job.v0 ?? null,
     allComplete,
     error: anyError ? job.error || job.steps.find((s) => s.error)?.error || "Job failed" : null,
   });
