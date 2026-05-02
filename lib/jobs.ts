@@ -8,7 +8,7 @@ import type { PracticeContext } from "./practice-context";
 import type { PracticeProfile } from "./profile-prospect";
 import type { VisualTokens } from "./visual-tokens";
 
-export type StepKey = "analyse" | "competitors" | "pilot";
+export type StepKey = "analyse" | "competitors" | "compose" | "pilot";
 export type StepStatus = "pending" | "in-progress" | "complete" | "error";
 
 export type JobStep = {
@@ -32,6 +32,16 @@ export type BattleCard = {
   lessonsFromPastProspects: string | null;
 };
 
+export type RendererTier = "proxy" | "claude" | "template";
+
+export type RendererInfo = {
+  tier: RendererTier;
+  reason: string;
+  bodyTextLength?: number;
+  htmlLength?: number;
+  decidedAt: string;
+};
+
 export type Job = {
   id: string;
   url: string;
@@ -43,6 +53,8 @@ export type Job = {
   practiceContext?: PracticeContext;
   battleCard?: BattleCard;
   pilotPath?: string;
+  componentBytes?: number;
+  renderer?: RendererInfo;
   error?: string;
 };
 
@@ -53,7 +65,8 @@ const jobKey = (id: string) => `job:${id}`;
 const defaultSteps = (): JobStep[] => [
   { key: "analyse", name: "Analysing the prospect", estimate: "~15s", status: "pending" },
   { key: "competitors", name: "Identifying competitors", estimate: "~25s", status: "pending" },
-  { key: "pilot", name: "Building the pilot site", estimate: "~30s", status: "pending" },
+  { key: "compose", name: "Generating fallback pilot UI", estimate: "~25s", status: "pending" },
+  { key: "pilot", name: "Building the pilot site", estimate: "~5s", status: "pending" },
 ];
 
 async function writeJob(job: Job): Promise<void> {

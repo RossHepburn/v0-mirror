@@ -4,15 +4,22 @@ import { useEffect, useState } from "react"
 import { useParams } from "next/navigation"
 import Link from "next/link"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { Check, Loader2, Clock, FileText, Globe, ArrowLeft, MessageSquare, AlertTriangle } from "lucide-react"
+import { Check, Loader2, Clock, FileText, Globe, ArrowLeft, MessageSquare, AlertTriangle, Copy, ExternalLink } from "lucide-react"
 
 type ApiStep = {
-  key: "analyse" | "competitors" | "pilot"
+  key: "analyse" | "competitors" | "compose" | "pilot"
   name: string
   estimate: string
   status: "pending" | "in-progress" | "complete" | "error"
   error?: string
 }
+
+type RendererTier = "proxy" | "claude" | "template"
+type RendererInfo = {
+  tier: RendererTier
+  reason: string
+  decidedAt?: string
+} | null
 
 type StatusResponse = {
   id: string
@@ -20,6 +27,8 @@ type StatusResponse = {
   steps: ApiStep[]
   pilotPath: string | null
   practiceContext: { slug: string; name: string } | null
+  renderer: RendererInfo
+  componentBytes: number | null
   allComplete: boolean
   error: string | null
 }
@@ -71,6 +80,11 @@ export default function JobStatusPage() {
   const analyseDone = steps.find((s) => s.key === "analyse")?.status === "complete"
   const cardReady = steps.find((s) => s.key === "competitors")?.status === "complete"
   const pilotReady = steps.find((s) => s.key === "pilot")?.status === "complete"
+  const renderer = data?.renderer ?? null
+  const pilotUrl =
+    typeof window !== "undefined" && data?.pilotPath
+      ? `${window.location.origin}${data.pilotPath}`
+      : data?.pilotPath ?? ""
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -189,6 +203,15 @@ export default function JobStatusPage() {
             />
           </div>
 
+          {pilotReady && data?.pilotPath && (
+            <PilotReadyCard
+              practiceName={data.practiceContext?.name || "this prospect"}
+              pilotPath={data.pilotPath}
+              pilotUrl={pilotUrl}
+              renderer={renderer}
+            />
+          )}
+
           {pilotReady && (
             <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
               <div className="flex items-center gap-2">
@@ -282,4 +305,138 @@ function ResultCard({
     )
   }
   return <Link href={href}>{inner}</Link>
+}
+
+const TIER_META: Record<
+  RendererTier,
+  { label: string; tone: string; toneClass: string; chip: string; headline: string; body: string }
+> = {
+  proxy: {
+    label: "Full mirror",
+    tone: "green",
+    toneClass:
+      "bg-emerald-500/15 text-emerald-300 border-emerald-500/40",
+    chip: "bg-emerald-500 text-emerald-50",
+    headline: "We fully mirrored the prospect's site.",
+    body:
+      "This is what the prospect will see when they click your link — their own site, with our chatbot embedded. Safe to share without a preview, but a quick look never hurts.",
+  },
+  claude: {
+    label: "Brand-matched recreation",
+    tone: "amber",
+    toneClass: "bg-amber-500/15 text-amber-200 border-amber-500/40",
+    chip: "bg-amber-500 text-amber-50",
+    headline: "We recreated their look-and-feel from extracted brand colours and content.",
+    body:
+      "We couldn't fully mirror the prospect's site — likely a single-page app, blocked our request, or loaded too sparsely. Recommend previewing before sharing.",
+  },
+  template: {
+    label: "Generic template with their content",
+    tone: "red",
+    toneClass: "bg-red-500/15 text-red-200 border-red-500/40",
+    chip: "bg-red-500 text-red-50",
+    headline:
+      "We weren't able to extract enough visual data to recreate their design.",
+    body:
+      "The pilot uses a generic dental template populated with their real practice info. Strongly recommend previewing before sharing — or running a different prospect URL if visual fidelity matters.",
+  },
+}
+
+function PilotReadyCard({
+  practiceName,
+  pilotPath,
+  pilotUrl,
+  renderer,
+}: {
+  practiceName: string
+  pilotPath: string
+  pilotUrl: string
+  renderer: RendererInfo
+}) {
+  const [copied, setCopied] = useState(false)
+  const tier = renderer?.tier
+  const meta = tier ? TIER_META[tier] : null
+
+  async function copyUrl() {
+    try {
+      await navigator.clipboard.writeText(pilotUrl)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1600)
+    } catch {
+      // ignore — fallback below shows the URL plainly
+    }
+  }
+
+  return (
+    <div className="rounded-xl border border-border bg-card p-5 space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-500">
+      <div className="flex items-start justify-between gap-3">
+        <div className="space-y-1">
+          <h2 className="text-base font-semibold text-foreground">Pilot ready</h2>
+          <p className="text-xs text-muted-foreground">
+            Share this link with {practiceName} after a quick preview.
+          </p>
+        </div>
+        {meta ? (
+          <span
+            className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider border ${meta.toneClass}`}
+          >
+            <span className={`h-1.5 w-1.5 rounded-full ${meta.chip}`} />
+            {meta.label}
+          </span>
+        ) : (
+          <span className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider border bg-muted text-muted-foreground">
+            <Loader2 className="h-3 w-3 animate-spin" />
+            Deciding renderer
+          </span>
+        )}
+      </div>
+
+      {meta && (
+        <div className="rounded-lg bg-secondary/40 border border-border/60 p-3 space-y-1">
+          <p className="text-sm font-medium text-foreground">{meta.headline}</p>
+          <p className="text-xs text-muted-foreground leading-relaxed">{meta.body}</p>
+          {renderer?.reason && (
+            <p className="text-[11px] text-muted-foreground/70 font-mono pt-1">
+              {renderer.reason}
+            </p>
+          )}
+        </div>
+      )}
+
+      <div className="flex items-center gap-2 rounded-lg border border-border bg-background p-2">
+        <code className="flex-1 truncate text-xs font-mono text-foreground" title={pilotUrl}>
+          {pilotUrl || pilotPath}
+        </code>
+        <button
+          type="button"
+          onClick={copyUrl}
+          className="inline-flex items-center gap-1.5 rounded-md bg-secondary hover:bg-secondary/80 px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors"
+        >
+          <Copy className="h-3 w-3" />
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+
+      <div className="flex flex-col sm:flex-row gap-2">
+        <a
+          href={pilotPath}
+          target="_blank"
+          rel="noreferrer"
+          className="flex-1 inline-flex items-center justify-center gap-2 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 px-4 py-2 text-sm font-medium transition-colors"
+        >
+          <ExternalLink className="h-4 w-4" />
+          Preview pilot before sharing
+        </a>
+      </div>
+
+      {tier !== "proxy" && (
+        <div className="flex items-start gap-2 rounded-md border border-amber-500/20 bg-amber-500/5 p-3">
+          <AlertTriangle className="h-4 w-4 text-amber-400 flex-shrink-0 mt-0.5" />
+          <p className="text-xs text-amber-100/90 leading-relaxed">
+            Take a moment to open the pilot and check the result before sending the URL — visual fidelity is lower than the &ldquo;Full mirror&rdquo; tier.
+          </p>
+        </div>
+      )}
+    </div>
+  )
 }
