@@ -7,6 +7,7 @@ import {
 } from "@/lib/practice-context";
 import { createBooking } from "@/lib/booking";
 
+export const runtime = "nodejs";
 export const maxDuration = 30;
 
 type ChatBody = {
