@@ -1,6 +1,6 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
-import os from "node:os";
+import { Redis } from "@upstash/redis";
+
+const kv = Redis.fromEnv();
 import type { PracticeContext } from "./practice-context";
 import type { PracticeProfile } from "./profile-prospect";
 import type { VisualTokens } from "./visual-tokens";
@@ -43,15 +43,9 @@ export type Job = {
   error?: string;
 };
 
-const JOBS_DIR = path.join(os.tmpdir(), "mirror-jobs");
+const JOB_TTL_SECONDS = 60 * 60 * 24 * 30;
 
-async function ensureDir() {
-  await fs.mkdir(JOBS_DIR, { recursive: true });
-}
-
-function jobPath(id: string) {
-  return path.join(JOBS_DIR, `${id}.json`);
-}
+const jobKey = (id: string) => `job:${id}`;
 
 const defaultSteps = (): JobStep[] => [
   { key: "analyse", name: "Analysing the prospect", estimate: "~15s", status: "pending" },
@@ -59,8 +53,11 @@ const defaultSteps = (): JobStep[] => [
   { key: "pilot", name: "Building the pilot site", estimate: "~30s", status: "pending" },
 ];
 
+async function writeJob(job: Job): Promise<void> {
+  await kv.set(jobKey(job.id), job, { ex: JOB_TTL_SECONDS });
+}
+
 export async function createJob(url: string): Promise<Job> {
-  await ensureDir();
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   const job: Job = {
@@ -70,18 +67,13 @@ export async function createJob(url: string): Promise<Job> {
     updatedAt: now,
     steps: defaultSteps(),
   };
-  await fs.writeFile(jobPath(id), JSON.stringify(job, null, 2));
+  await writeJob(job);
   return job;
 }
 
 export async function readJob(id: string): Promise<Job | null> {
-  try {
-    const raw = await fs.readFile(jobPath(id), "utf8");
-    return JSON.parse(raw) as Job;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw err;
-  }
+  const job = await kv.get<Job>(jobKey(id));
+  return job ?? null;
 }
 
 export async function updateJob(id: string, patch: (job: Job) => void | Promise<void>): Promise<Job> {
@@ -89,7 +81,7 @@ export async function updateJob(id: string, patch: (job: Job) => void | Promise<
   if (!job) throw new Error(`Job ${id} not found`);
   await patch(job);
   job.updatedAt = new Date().toISOString();
-  await fs.writeFile(jobPath(id), JSON.stringify(job, null, 2));
+  await writeJob(job);
   return job;
 }
 

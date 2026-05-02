@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
+import { start } from "workflow/api";
 import { createJob } from "@/lib/jobs";
-import { runBuildPilot } from "@/lib/build-pilot";
+import { buildPilotWorkflow } from "@/workflow/build-pilot";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
 
 export async function POST(req: Request) {
   let url: string;
@@ -28,12 +28,7 @@ export async function POST(req: Request) {
 
   const job = await createJob(url);
 
-  // Fire-and-forget the background work. The Next.js dev server keeps the
-  // process alive; on Vercel we'd lift this onto Workflow/Inngest, but for
-  // hackathon time pressure /tmp + an in-process promise is enough.
-  runBuildPilot(job.id, url).catch((err) => {
-    console.error(`[api/jobs/create] runBuildPilot crashed for ${job.id}:`, err);
-  });
+  const run = await start(buildPilotWorkflow, [{ jobId: job.id, url }]);
 
-  return NextResponse.json({ id: job.id });
+  return NextResponse.json({ id: job.id, runId: run.runId });
 }
