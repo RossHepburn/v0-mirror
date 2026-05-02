@@ -5,6 +5,7 @@ import {
   practiceContextAsSystemFacts,
   type PracticeContext,
 } from "@/lib/practice-context";
+import { createBooking } from "@/lib/booking";
 
 export const maxDuration = 30;
 
@@ -42,18 +43,7 @@ const bookAppointmentTool = tool({
     patientContact: z.string().describe("Phone number or email address for the patient"),
     treatment: z.string().optional().describe("Treatment / appointment type if known"),
   }),
-  execute: async (input) => {
-    const baseUrl = process.env.NEXT_PUBLIC_BASE_URL ?? "http://localhost:3000";
-    const res = await fetch(`${baseUrl}/api/booking/create`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(input),
-    });
-    if (!res.ok) {
-      return { ok: false, error: `Booking endpoint returned ${res.status}` };
-    }
-    return await res.json();
-  },
+  execute: async (input) => createBooking(input),
 });
 
 export async function POST(req: Request) {
