@@ -1,9 +1,10 @@
 import { FatalError } from "workflow";
-import { setStep, updateJob } from "@/lib/jobs";
+import { setStep, updateJob, readJob } from "@/lib/jobs";
 import { profileProspect } from "@/lib/profile-prospect";
 import { extractVisualTokens } from "@/lib/visual-tokens";
 import { fromProfile } from "@/lib/practice-context";
 import { generateBattleCard } from "@/lib/battle-card";
+import { composeComponent, saveComponent } from "@/lib/compose";
 
 async function analyseStep(jobId: string, url: string) {
   "use step";
@@ -59,6 +60,27 @@ async function pilotStep(jobId: string) {
   await setStep(jobId, "pilot", "complete");
 }
 
+async function composeStep(
+  jobId: string,
+  url: string,
+  payload: Awaited<ReturnType<typeof analyseStep>>,
+) {
+  "use step";
+  await setStep(jobId, "compose", "in-progress");
+  const job = await readJob(jobId);
+  if (!job?.visual) throw new Error("compose: visual tokens missing on job");
+  const tsx = await composeComponent({
+    url,
+    practiceContext: payload.ctx,
+    visual: job.visual,
+  });
+  await saveComponent(jobId, tsx);
+  await updateJob(jobId, (j) => {
+    j.componentBytes = tsx.length;
+  });
+  await setStep(jobId, "compose", "complete");
+}
+
 async function markFailureStep(jobId: string, message: string) {
   "use step";
   await updateJob(jobId, (job) => {
@@ -85,6 +107,7 @@ export async function buildPilotWorkflow(input: { jobId: string; url: string }) 
   try {
     const analysed = await analyseStep(jobId, url);
     await competitorsStep(jobId, url, analysed);
+    await composeStep(jobId, url, analysed);
     await pilotStep(jobId);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
