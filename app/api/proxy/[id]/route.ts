@@ -11,10 +11,12 @@ export async function GET(
   const url = new URL(req.url);
   const requestOrigin = `${url.protocol}//${url.host}`;
   const force = url.searchParams.get("refresh") === "1";
+  const path = url.searchParams.get("path") ?? undefined;
 
   const { status, body, headers } = await getProxiedHtml({
     jobId: id,
     requestOrigin,
+    path,
     force,
   });
   return new Response(body, { status, headers });

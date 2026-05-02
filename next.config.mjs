@@ -9,6 +9,9 @@ const nextConfig = {
     unoptimized: true,
   },
   serverExternalPackages: ["ajv", "@vercel/oidc"],
+  turbopack: {
+    root: import.meta.dirname,
+  },
 };
 
 export default withWorkflow(nextConfig);
