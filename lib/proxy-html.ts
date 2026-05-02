@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as cheerio from "cheerio";
 import { Redis } from "@upstash/redis";
 import { readJob, updateJob } from "@/lib/jobs";
@@ -13,8 +14,22 @@ const kv = new Redis({
 
 const PROXIED_TTL_SECONDS = 60 * 60;
 const RENDERED_TTL_SECONDS = 60 * 60;
-const proxiedKey = (id: string) => `job:${id}:proxied-html`;
-const renderedKey = (id: string, tier: RendererTier) => `job:${id}:rendered-${tier}`;
+
+export function normalisePath(rawPath: string | null | undefined): string {
+  if (!rawPath) return "/";
+  let p = rawPath.trim();
+  if (!p) return "/";
+  if (!p.startsWith("/")) p = "/" + p;
+  return p;
+}
+
+function pathHash(path: string): string {
+  return createHash("sha1").update(path).digest("hex").slice(0, 8);
+}
+
+const proxiedKey = (id: string, hash: string) => `job:${id}:proxied-html:${hash}`;
+const renderedKey = (id: string, tier: RendererTier, hash: string) =>
+  `job:${id}:rendered-${tier}:${hash}`;
 
 const SCRIPT_HOST_BLOCKLIST = [
   "google-analytics.com",
@@ -52,6 +67,28 @@ const SCRIPT_HOST_BLOCKLIST = [
   "consent.cookiebot.com",
   "consent.cookiefirst.com",
   "cookieyes.com",
+];
+
+// Inline analytics SDK markers — substring match (case-insensitive) against
+// script innerHTML for <script> tags WITHOUT a src attribute. Aggressive on
+// purpose: false positives matter less than false negatives here.
+const INLINE_ANALYTICS_MARKERS = [
+  "datalayer",
+  "gtag(",
+  "gtag('",
+  "_gaq",
+  "ga('",
+  "fbq(",
+  "hj(",
+  "clarity(",
+  "_paq",
+  "window.datalayer",
+  "googletagmanager",
+  "google-analytics",
+  "hotjar",
+  "clarity",
+  "mixpanel",
+  "amplitude",
 ];
 
 const ATTR_TARGETS: Array<[string, string]> = [
@@ -238,6 +275,14 @@ export function rewriteHtml(opts: {
     }
   });
 
+  $("script:not([src])").each((_, el) => {
+    const text = ($(el).html() || "").toLowerCase();
+    if (!text) return;
+    if (INLINE_ANALYTICS_MARKERS.some((m) => text.includes(m))) {
+      $(el).remove();
+    }
+  });
+
   $("noscript").remove();
 
   for (const [tag, attr] of ATTR_TARGETS) {
@@ -247,6 +292,61 @@ export function rewriteHtml(opts: {
       $(el).attr(attr, absolutise(val, sourceBase) || val);
     });
   }
+
+  const sourceOrigin = sourceBase.origin;
+  const pilotBase = `/p/${opts.jobId}`;
+
+  $("a[href]").each((_, el) => {
+    const href = ($(el).attr("href") || "").trim();
+    if (!href) return;
+    if (href.startsWith("#")) return;
+    if (/^(mailto|tel|sms):/i.test(href)) return;
+    if (/^javascript:/i.test(href)) {
+      $(el).removeAttr("href");
+      return;
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(href, sourceBase);
+    } catch {
+      return;
+    }
+    if (parsed.origin === sourceOrigin) {
+      const innerPath = parsed.pathname + parsed.search + parsed.hash;
+      $(el).attr("href", `${pilotBase}?path=${encodeURIComponent(innerPath)}`);
+      // Internal nav stays in the pilot tab — strip target=_blank if set.
+      const target = ($(el).attr("target") || "").toLowerCase();
+      if (target === "_blank") $(el).removeAttr("target");
+    } else {
+      if (!$(el).attr("target")) $(el).attr("target", "_blank");
+      const rel = ($(el).attr("rel") || "").toLowerCase();
+      const relSet = new Set(rel.split(/\s+/).filter(Boolean));
+      relSet.add("noopener");
+      relSet.add("noreferrer");
+      $(el).attr("rel", Array.from(relSet).join(" "));
+    }
+  });
+
+  // TODO(internal-nav): proxy form submissions server-side. For now we only
+  // rewrite the action URL so GET forms (search etc.) stay in-pilot — POSTs
+  // will hit /p/[id] which is GET-only and 405. Acceptable for the demo:
+  // most prospect contact forms are out-of-scope until a real prospect tries
+  // to use one through the pilot.
+  $("form[action]").each((_, el) => {
+    const action = ($(el).attr("action") || "").trim();
+    if (!action) return;
+    if (/^(mailto|javascript):/i.test(action)) return;
+    let parsed: URL;
+    try {
+      parsed = new URL(action, sourceBase);
+    } catch {
+      return;
+    }
+    if (parsed.origin === sourceOrigin) {
+      const innerPath = parsed.pathname + parsed.search;
+      $(el).attr("action", `${pilotBase}?path=${encodeURIComponent(innerPath)}`);
+    }
+  });
 
   // Route external CSS through the asset proxy with CSS rewriting on, so
   // any @font-face url(...) inside is also proxied (avoiding cross-origin
@@ -375,14 +475,16 @@ async function renderProxyTier(opts: {
   jobId: string;
   requestOrigin: string;
   rawHtml: string;
+  path: string;
   cacheWrite: boolean;
 }): Promise<string> {
   const job = await readJob(opts.jobId);
   if (!job) throw new Error("Job vanished while rendering proxy tier");
   const practiceName = job.practiceContext?.name || job.profile?.practiceName || "Practice";
+  const fullSourceUrl = new URL(opts.path, job.url).toString();
   const rewritten = rewriteHtml({
     rawHtml: opts.rawHtml,
-    sourceUrl: job.url,
+    sourceUrl: fullSourceUrl,
     jobId: opts.jobId,
     practiceName,
     requestOrigin: opts.requestOrigin,
@@ -391,7 +493,9 @@ async function renderProxyTier(opts: {
   });
   if (opts.cacheWrite) {
     try {
-      await kv.set(proxiedKey(opts.jobId), rewritten, { ex: PROXIED_TTL_SECONDS });
+      await kv.set(proxiedKey(opts.jobId, pathHash(opts.path)), rewritten, {
+        ex: PROXIED_TTL_SECONDS,
+      });
     } catch (err) {
       console.error("[proxy] cache write failed:", err);
     }
@@ -404,11 +508,15 @@ async function renderProxyTier(opts: {
 export async function getProxiedHtml(opts: {
   jobId: string;
   requestOrigin: string;
+  path?: string;
   force?: boolean;
 }): Promise<{ status: number; body: string; headers: HeadersInit }> {
+  const path = normalisePath(opts.path);
+  const hash = pathHash(path);
+
   if (!opts.force) {
     try {
-      const cached = await kv.get<string>(proxiedKey(opts.jobId));
+      const cached = await kv.get<string>(proxiedKey(opts.jobId, hash));
       if (cached) {
         return { status: 200, body: cached, headers: htmlResponseHeaders() };
       }
@@ -425,9 +533,10 @@ export async function getProxiedHtml(opts: {
     return { status: 400, body: "Job has no source URL", headers: { "Content-Type": "text/plain" } };
   }
 
+  const fullUrl = new URL(path, job.url).toString();
   let raw: string;
   try {
-    raw = await fetchHtmlViaBrightData(job.url);
+    raw = await fetchHtmlViaBrightData(fullUrl);
   } catch (err) {
     return {
       status: 502,
@@ -440,6 +549,7 @@ export async function getProxiedHtml(opts: {
     jobId: opts.jobId,
     requestOrigin: opts.requestOrigin,
     rawHtml: raw,
+    path,
     cacheWrite: true,
   });
   return { status: 200, body, headers: htmlResponseHeaders() };
@@ -450,8 +560,13 @@ export async function getProxiedHtml(opts: {
 export async function getRenderedPilot(opts: {
   jobId: string;
   requestOrigin: string;
+  path?: string;
   force?: boolean;
 }): Promise<{ status: number; body: string; headers: HeadersInit; tier?: RendererTier }> {
+  const path = normalisePath(opts.path);
+  const isHomepage = path === "/";
+  const hash = pathHash(path);
+
   const job = await readJob(opts.jobId);
   if (!job) {
     return { status: 404, body: "Job not found", headers: { "Content-Type": "text/plain" } };
@@ -470,14 +585,29 @@ export async function getRenderedPilot(opts: {
   // 1. Use cached decision when present
   const cachedTier = !opts.force ? job.renderer?.tier : undefined;
   if (cachedTier) {
-    const cached = await kv.get<string>(renderedKey(opts.jobId, cachedTier)).catch(() => null);
+    const cached = await kv
+      .get<string>(renderedKey(opts.jobId, cachedTier, hash))
+      .catch(() => null);
     if (cached) {
       return { status: 200, body: cached, headers: htmlResponseHeaders(), tier: cachedTier };
+    }
+    // Internal pages only make sense for the proxy tier — Claude/template
+    // are single-page renders. Fall back to the homepage render for nav
+    // clicks under those tiers.
+    if (cachedTier !== "proxy" && !isHomepage) {
+      const homeHash = pathHash("/");
+      const home = await kv
+        .get<string>(renderedKey(opts.jobId, cachedTier, homeHash))
+        .catch(() => null);
+      if (home) {
+        return { status: 200, body: home, headers: htmlResponseHeaders(), tier: cachedTier };
+      }
     }
   }
 
   // 2. Try proxy tier (single BD call). On ok → render proxy.
-  const assessment = await assessProxyViability(job.url);
+  const fullUrl = new URL(path, job.url).toString();
+  const assessment = await assessProxyViability(fullUrl);
 
   let chosenTier: RendererTier;
   let reason: string;
@@ -490,6 +620,7 @@ export async function getRenderedPilot(opts: {
       jobId: opts.jobId,
       requestOrigin: opts.requestOrigin,
       rawHtml: assessment.rawHtml,
+      path,
       cacheWrite: true,
     });
   } else {
@@ -497,7 +628,7 @@ export async function getRenderedPilot(opts: {
     const tsx = await readComponent(opts.jobId).catch(() => null);
     if (tsx) {
       chosenTier = "claude";
-      reason = `${assessment.status === "sparse" ? assessment.reason : assessment.reason} → using Claude`;
+      reason = `${assessment.reason} → using Claude`;
       html = renderClaudeHtml({
         jobId: opts.jobId,
         ctx: job.practiceContext,
@@ -507,7 +638,7 @@ export async function getRenderedPilot(opts: {
       });
     } else {
       chosenTier = "template";
-      reason = `${assessment.status === "sparse" ? assessment.reason : assessment.reason} → no Claude component → using template`;
+      reason = `${assessment.reason} → no Claude component → using template`;
       html = renderTemplateHtml({
         jobId: opts.jobId,
         ctx: job.practiceContext,
@@ -517,27 +648,32 @@ export async function getRenderedPilot(opts: {
     }
   }
 
-  // 3. Persist tier + cache rendered HTML
-  const persistedAssessment =
-    assessment.status === "blocked"
-      ? { htmlLength: undefined, bodyTextLength: undefined }
-      : { htmlLength: assessment.htmlLength, bodyTextLength: assessment.bodyTextLength };
+  // 3. Persist tier (only on the homepage — internal-nav assessments are
+  // per-path noise) + cache rendered HTML keyed by path.
+  if (isHomepage) {
+    const persistedAssessment =
+      assessment.status === "blocked"
+        ? { htmlLength: undefined, bodyTextLength: undefined }
+        : { htmlLength: assessment.htmlLength, bodyTextLength: assessment.bodyTextLength };
 
-  try {
-    await updateJob(opts.jobId, (j) => {
-      j.renderer = {
-        tier: chosenTier,
-        reason,
-        htmlLength: persistedAssessment.htmlLength,
-        bodyTextLength: persistedAssessment.bodyTextLength,
-        decidedAt: new Date().toISOString(),
-      };
-    });
-  } catch (err) {
-    console.error("[pilot] failed to persist renderer info:", err);
+    try {
+      await updateJob(opts.jobId, (j) => {
+        j.renderer = {
+          tier: chosenTier,
+          reason,
+          htmlLength: persistedAssessment.htmlLength,
+          bodyTextLength: persistedAssessment.bodyTextLength,
+          decidedAt: new Date().toISOString(),
+        };
+      });
+    } catch (err) {
+      console.error("[pilot] failed to persist renderer info:", err);
+    }
   }
   try {
-    await kv.set(renderedKey(opts.jobId, chosenTier), html, { ex: RENDERED_TTL_SECONDS });
+    await kv.set(renderedKey(opts.jobId, chosenTier, hash), html, {
+      ex: RENDERED_TTL_SECONDS,
+    });
   } catch (err) {
     console.error("[pilot] rendered cache write failed:", err);
   }

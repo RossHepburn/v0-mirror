@@ -11,10 +11,12 @@ export async function GET(
   const url = new URL(req.url);
   const requestOrigin = `${url.protocol}//${url.host}`;
   const force = url.searchParams.get("refresh") === "1";
+  const path = url.searchParams.get("path") ?? undefined;
 
   const { status, body, headers, tier } = await getRenderedPilot({
     jobId: id,
     requestOrigin,
+    path,
     force,
   });
   const out = new Headers(headers as HeadersInit);
