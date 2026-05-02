@@ -1,6 +1,9 @@
 import { Redis } from "@upstash/redis";
 
-const kv = Redis.fromEnv();
+const kv = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_KV_REST_API_URL!,
+  token: process.env.UPSTASH_REDIS_REST_KV_REST_API_TOKEN!,
+});
 import type { PracticeContext } from "./practice-context";
 import type { PracticeProfile } from "./profile-prospect";
 import type { VisualTokens } from "./visual-tokens";
