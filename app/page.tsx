@@ -9,19 +9,32 @@ import { ArrowRight } from "lucide-react"
 export default function HomePage() {
   const [url, setUrl] = useState("")
   const [isLoading, setIsLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const router = useRouter()
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!url.trim()) return
 
+    setError(null)
     setIsLoading(true)
-    // Generate a fake job ID (UUID-like)
-    const jobId = crypto.randomUUID()
-    
-    // Simulate a brief delay before navigation
-    await new Promise((resolve) => setTimeout(resolve, 300))
-    router.push(`/jobs/${jobId}`)
+
+    try {
+      const res = await fetch("/api/jobs/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: url.trim() }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error || `Failed (${res.status})`)
+      }
+      const { id } = await res.json()
+      router.push(`/jobs/${id}`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to start job")
+      setIsLoading(false)
+    }
   }
 
   return (
@@ -53,7 +66,7 @@ export default function HomePage() {
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="relative">
               <Input
-                type="url"
+                type="text"
                 placeholder="Enter the prospect's website URL"
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
@@ -69,7 +82,7 @@ export default function HomePage() {
               {isLoading ? (
                 <span className="flex items-center gap-2">
                   <span className="h-4 w-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
-                  Building...
+                  Starting…
                 </span>
               ) : (
                 <span className="flex items-center gap-2">
@@ -78,6 +91,9 @@ export default function HomePage() {
                 </span>
               )}
             </Button>
+            {error && (
+              <p className="text-sm text-red-500 text-center">{error}</p>
+            )}
           </form>
         </div>
       </main>

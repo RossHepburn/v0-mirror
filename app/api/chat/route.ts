@@ -1,4 +1,14 @@
-import { convertToModelMessages, streamText, tool, stepCountIs, type UIMessage } from "ai";
+import {
+  convertToModelMessages,
+  streamText,
+  tool,
+  stepCountIs,
+  wrapLanguageModel,
+  type UIMessage,
+} from "ai";
+import { gateway } from "@ai-sdk/gateway";
+import { mubitMemoryMiddleware } from "@mubit-ai/ai-sdk";
+import { after } from "next/server";
 import { z } from "zod";
 import {
   mockPracticeContext,
@@ -6,17 +16,45 @@ import {
   type PracticeContext,
 } from "@/lib/practice-context";
 import { createBooking } from "@/lib/booking";
+import {
+  mubit,
+  sessionFor,
+  lessonsForChat,
+} from "@/lib/mubit";
 
 export const runtime = "nodejs";
-export const maxDuration = 30;
+export const maxDuration = 60;
 
 type ChatBody = {
   messages: UIMessage[];
   practiceContext?: PracticeContext;
+  visitorId?: string;
 };
 
-function buildSystemPrompt(ctx: PracticeContext): string {
+function lastUserText(messages: UIMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "user") continue;
+    const text = m.parts
+      ?.map((p) => (p.type === "text" ? (p as { text?: string }).text || "" : ""))
+      .join(" ")
+      .trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function buildSystemPrompt(ctx: PracticeContext, lessons: string | null): string {
   const facts = practiceContextAsSystemFacts(ctx);
+  const lessonBlock = lessons
+    ? [
+        ``,
+        `=== LESSONS FROM PRIOR PROSPECTS (Mubit cross-prospect lane) ===`,
+        lessons,
+        `=== END LESSONS ===`,
+        `Use these as soft guidance about which framings convert. Never invent facts from them.`,
+      ].join("\n")
+    : "";
   return [
     `You are the website assistant for ${ctx.name}, a UK dental practice.`,
     `Speak warmly, professionally and concisely — like a friendly receptionist. Use British English.`,
@@ -30,32 +68,72 @@ function buildSystemPrompt(ctx: PracticeContext): string {
     `=== PRACTICE FACTS ===`,
     facts,
     `=== END PRACTICE FACTS ===`,
+    lessonBlock,
   ].join("\n");
 }
 
-const bookAppointmentTool = tool({
-  description:
-    "Book an appointment for a patient with a named practitioner at a specific date/time. Only call this after collecting practitioner, date, time, patient name and a contact (phone or email).",
-  inputSchema: z.object({
-    practitioner: z.string().describe("Practitioner name (must match one of the practice's practitioners)"),
-    date: z.string().describe("ISO date YYYY-MM-DD"),
-    time: z.string().describe("Local time HH:mm (24h)"),
-    patientName: z.string().describe("Full name of the patient"),
-    patientContact: z.string().describe("Phone number or email address for the patient"),
-    treatment: z.string().optional().describe("Treatment / appointment type if known"),
-  }),
-  execute: async (input) => createBooking(input),
-});
+const bookAppointmentTool = (ctx: PracticeContext, visitorId: string) =>
+  tool({
+    description:
+      "Book an appointment for a patient with a named practitioner at a specific date/time. Only call this after collecting practitioner, date, time, patient name and a contact (phone or email).",
+    inputSchema: z.object({
+      practitioner: z.string(),
+      date: z.string().describe("ISO date YYYY-MM-DD"),
+      time: z.string().describe("Local time HH:mm (24h)"),
+      patientName: z.string(),
+      patientContact: z.string(),
+      treatment: z.string().optional(),
+    }),
+    execute: async (input) => {
+      const result = await createBooking(input);
+      // Best-effort cross-prospect lesson capture, after the response.
+      after(async () => {
+        try {
+          const { recordConversion } = await import("@/lib/mubit");
+          await recordConversion({
+            practiceSlug: ctx.slug,
+            visitorId,
+            trigger: "booking_form",
+            question: input.treatment ? `Booking for ${input.treatment}` : "Booking request",
+            lastBotMessage: `Booked ${result.appointment.practitioner} on ${result.appointment.date} at ${result.appointment.time} (ref ${result.reference}).`,
+          });
+        } catch (err) {
+          console.error("[chat-route] recordConversion failed:", err);
+        }
+      });
+      return result;
+    },
+  });
 
 export async function POST(req: Request) {
   const body = (await req.json()) as ChatBody;
   const ctx = body.practiceContext ?? mockPracticeContext;
+  const visitorId = body.visitorId || "anon";
+  const session = sessionFor(ctx.slug, visitorId);
+
+  // One explicit recall against the cross-prospect lane for this turn's
+  // user query. Per Session D's verified pattern (SPEC §3 supersede).
+  const userQuery = lastUserText(body.messages);
+  const lessons = userQuery ? await lessonsForChat(userQuery) : null;
+
+  const wrapped = wrapLanguageModel({
+    model: gateway("anthropic/claude-sonnet-4.5"),
+    middleware: mubitMemoryMiddleware({
+      mubitClient: mubit(),
+      sessionId: session,
+      agentId: "mirror-chatbot",
+      injectLessons: false, // we inject manually above; middleware just captures
+      captureInteractions: true,
+      failOpen: true,
+      scheduleIngest: (task) => after(() => task()),
+    }),
+  });
 
   const result = streamText({
-    model: "anthropic/claude-sonnet-4.5",
-    system: buildSystemPrompt(ctx),
+    model: wrapped,
+    system: buildSystemPrompt(ctx, lessons?.summary || null),
     messages: await convertToModelMessages(body.messages),
-    tools: { book_appointment: bookAppointmentTool },
+    tools: { book_appointment: bookAppointmentTool(ctx, visitorId) },
     stopWhen: stepCountIs(5),
     providerOptions: {
       gateway: {
